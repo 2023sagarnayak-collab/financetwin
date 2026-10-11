@@ -4,7 +4,7 @@ An intelligent personal financial planning and decision support system, built fo
 
 Most budgeting apps only record past spending. FinanceTwin looks forward: it scores financial health, forecasts spending, segments spending behaviour, and gives personalised suggestions.
 
-**Live demo:** _add the Streamlit link here after deployment_
+**Live demo:**  https://financetwin-qsfufrgfvi4ctw9sy28cxs.streamlit.app/
 
 ## Features
 
