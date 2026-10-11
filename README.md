@@ -14,6 +14,7 @@ Most budgeting apps only record past spending. FinanceTwin looks forward: it sco
 | Spending Forecast | Projects monthly spending | Exponential smoothing, backtested against baselines |
 | Customer Segments | Groups customers into active and lapsed spenders | RFM features, log scaling, k-means |
 | Recommendations | Suggests what to improve | Transparent rule-based thresholds on raw ratios |
+| What-If Simulator | Shows how long a savings goal takes under different income, spending and saving choices | Month-by-month compound-growth projection |
 
 ## Datasets (all public, from Kaggle)
 
