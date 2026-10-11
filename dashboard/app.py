@@ -11,6 +11,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT)
 from models.health_score import engineer_features, compute_health_score
 from engine.recommender import generate_recommendations
+from engine.whatif import run_scenario, project_balance
 
 PROCESSED_DIR = os.path.join(ROOT, "data", "processed")
 
@@ -81,14 +82,30 @@ def score_user(income, salary, debt, balance, invested, emi, credit_util, data):
     return metrics, sub, score
 
 
+def fmt_duration(months):
+    if months is None:
+        return "Not reachable"
+    years, rem = divmod(int(months), 12)
+    if years == 0:
+        return f"{rem} mo"
+    if rem == 0:
+        return f"{years} yr"
+    return f"{years} yr {rem} mo"
+
+
+def fmt_money_delta(value):
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}₹{abs(value):,.0f}"
+
+
 # ---------- pages ----------
 def page_overview():
     st.title("FinanceTwin")
     st.subheader("An intelligent personal financial planning and decision support system")
     st.write(
         "Most budgeting apps only record what you already spent. FinanceTwin looks forward: "
-        "it scores your financial health, forecasts spending, groups spending behaviour, "
-        "and suggests what to improve."
+        "it scores your financial health, tests goals with what-if scenarios, forecasts "
+        "spending, groups spending behaviour, and suggests what to improve."
     )
 
     data = load_scored_data()
@@ -109,20 +126,18 @@ def page_overview():
     st.altair_chart(chart)
 
     st.subheader("What you can do here")
-    a, b = st.columns(2)
-    with a.container(border=True):
-        st.markdown("**My Financial Health**")
-        st.write("Enter your numbers, get your score, and see personalised suggestions.")
-    with b.container(border=True):
-        st.markdown("**Spending Forecast**")
-        st.write("See past monthly spending and a projection of the next months.")
-    c, d = st.columns(2)
-    with c.container(border=True):
-        st.markdown("**Customer Segments**")
-        st.write("See how customers split into active and lapsed spending groups.")
-    with d.container(border=True):
-        st.markdown("**About & Methodology**")
-        st.write("Datasets, validation results and honest limitations.")
+    cards = [
+        ("My Financial Health", "Enter your numbers, get your score, and see personalised suggestions."),
+        ("What-If Simulator", "Set a savings goal and see how income, spending or saving changes affect the time to reach it."),
+        ("Spending Forecast", "See past monthly spending and a projection of the next months."),
+        ("Customer Segments", "See how customers split into active and lapsed spending groups."),
+        ("About & Methodology", "Datasets, validation results and honest limitations."),
+    ]
+    slots = st.columns(3) + st.columns(3)
+    for slot, (title, text) in zip(slots, cards):
+        with slot.container(border=True):
+            st.markdown(f"**{title}**")
+            st.write(text)
 
 
 def page_health():
@@ -193,6 +208,122 @@ def page_health():
                 st.warning(text)
             else:
                 st.info(text)
+
+
+def page_whatif():
+    st.title("What-If Simulator")
+    st.write(
+        "Set a savings goal, then change income, spending or how much you save, and see how "
+        "long the goal takes. Amounts are in rupees."
+    )
+
+    st.subheader("Your situation and goal")
+    c1, c2 = st.columns(2, gap="large")
+    with c1:
+        income = st.number_input("Monthly income (₹)", min_value=0, value=60000, step=1000)
+        expenses = st.number_input("Monthly living expenses, excluding EMI (₹)", min_value=0, value=30000, step=1000)
+        emi = st.number_input("Monthly EMI (₹)", min_value=0, value=8000, step=500)
+    with c2:
+        goal = st.number_input("Goal amount (₹)", min_value=1000, value=500000, step=10000)
+        current = st.number_input("Already saved towards this goal (₹)", min_value=0, value=50000, step=5000)
+        allocation = st.slider("Share of monthly surplus put towards the goal (%)", 0, 100, 70)
+    annual_return = st.slider(
+        "Expected yearly return (%)", 0.0, 15.0, 6.0, step=0.5,
+        help="Enter a return after inflation if you want the goal read in today's rupees.",
+    )
+
+    st.subheader("What if...?")
+    w1, w2 = st.columns(2, gap="large")
+    with w1:
+        d_income = st.slider("Change in income (%)", -50, 100, 10)
+        d_expense = st.slider("Change in living expenses (%)", -50, 50, 0)
+    with w2:
+        d_alloc = st.slider("Change in share of surplus saved (percentage points)", -50, 50, 0)
+        d_return = st.slider("Change in expected return (percentage points)", -5.0, 5.0, 0.0, step=0.5)
+
+    scn_income = income * (1 + d_income / 100)
+    scn_expenses = expenses * (1 + d_expense / 100)
+    scn_alloc = min(max(allocation + d_alloc, 0), 100)
+    scn_return = max(annual_return + d_return, 0.0)
+
+    base = run_scenario(income, expenses, emi, allocation / 100, annual_return / 100, current, goal)
+    scn = run_scenario(scn_income, scn_expenses, emi, scn_alloc / 100, scn_return / 100, current, goal)
+
+    if base["surplus"] <= 0:
+        st.warning("With today's numbers, expenses and EMI use up all of your income, so nothing is left to save.")
+    if scn["surplus"] <= 0:
+        st.warning("In the what-if plan, expenses and EMI use up all of your income, so nothing is left to save.")
+
+    st.subheader("Results")
+    r1, r2, r3 = st.columns(3)
+    r1.metric("Time to goal: today's plan", fmt_duration(base["months"]))
+    delta = None
+    if base["months"] is not None and scn["months"] is not None:
+        delta = f"{scn['months'] - base['months']:+d} months"
+    r2.metric("Time to goal: what-if plan", fmt_duration(scn["months"]), delta=delta, delta_color="inverse")
+    r3.metric(
+        "Saved towards goal each month (what-if)",
+        f"₹{scn['contribution']:,.0f}",
+        delta=fmt_money_delta(scn["contribution"] - base["contribution"]),
+    )
+
+    if base["months"] is None and scn["months"] is None:
+        st.error("Neither plan reaches the goal within 50 years. Try a larger surplus, a smaller goal or a higher return.")
+    elif base["months"] is None:
+        st.success(f"The what-if plan makes the goal reachable, in {fmt_duration(scn['months'])}.")
+    elif scn["months"] is None:
+        st.error("The what-if plan no longer reaches the goal within 50 years.")
+    else:
+        diff = base["months"] - scn["months"]
+        if diff > 0:
+            st.success(f"The what-if plan reaches the goal {fmt_duration(diff)} sooner.")
+        elif diff < 0:
+            st.warning(f"The what-if plan reaches the goal {fmt_duration(-diff)} later.")
+        else:
+            st.info("These changes make no difference to the time needed.")
+
+    candidates = [m for m in (base["months"], scn["months"]) if m]
+    horizon = int(max(candidates) * 1.2) + 6 if candidates else 120
+    horizon = min(max(horizon, 60), 600)
+
+    base_bal = project_balance(current, base["contribution"], annual_return / 100, horizon)
+    scn_bal = project_balance(current, scn["contribution"], scn_return / 100, horizon)
+
+    chart_df = pd.DataFrame({
+        "Years": [m / 12 for m in range(horizon + 1)],
+        "Today's plan": base_bal,
+        "What-if plan": scn_bal,
+    }).melt("Years", var_name="Plan", value_name="Balance")
+
+    lines = alt.Chart(chart_df).mark_line().encode(
+        x=alt.X("Years:Q", title="Years from now"),
+        y=alt.Y("Balance:Q", title="Savings towards goal (₹)"),
+        color=alt.Color("Plan:N", title=None),
+        tooltip=[
+            alt.Tooltip("Years:Q", format=".1f"),
+            "Plan:N",
+            alt.Tooltip("Balance:Q", format=",.0f"),
+        ],
+    )
+    goal_line = alt.Chart(pd.DataFrame({"Goal": [goal]})).mark_rule(
+        color="gray", strokeDash=[6, 4]
+    ).encode(y="Goal:Q")
+    st.altair_chart(lines + goal_line)
+    st.caption(
+        f"The dashed line is your goal. Balance after 5 years: ₹{base_bal[60]:,.0f} "
+        f"(today's plan) vs ₹{scn_bal[60]:,.0f} (what-if plan)."
+    )
+
+    with st.expander("How this is calculated"):
+        st.markdown(
+            """
+- Monthly surplus = income - living expenses - EMI.
+- Amount saved each month = surplus x the share you put towards the goal.
+- Each month the balance grows by the expected return (yearly rate divided by 12), then the monthly amount is added.
+- Income, expenses and EMI are assumed constant. Taxes, market ups and downs and inflation are not modelled, so enter a return after inflation to read results in today's rupees.
+- This is an illustration based on your inputs, not a prediction or financial advice.
+"""
+        )
 
 
 def page_forecast():
@@ -320,6 +451,7 @@ def page_about():
 | Module | Data used | Method |
 |---|---|---|
 | Financial Health Score | Credit score classification dataset (Kaggle) | Weighted score from debt, EMI, savings, investment and credit-use ratios |
+| What-If Simulator | User inputs only | Month-by-month compound-growth projection towards a savings goal |
 | Spending forecast | Personal budget transactions (Kaggle) | Exponential smoothing, backtested against baselines |
 | Customer segments | Online Retail II (Kaggle) | RFM features, log-scaling, k-means |
 | Recommendations | Output of the Health Score | Transparent rule-based thresholds |
@@ -334,6 +466,7 @@ def page_about():
 - About 18% of credit records were dropped because of missing salary values.
 - Weights and recommendation thresholds are design choices and can be tuned. They are calibrated to the benchmark dataset and would need recalibration for region-specific borrowing patterns.
 - Amounts on the Forecast and Segments pages are in the source datasets' own units (currency not standardised). The Health Score uses ratios, so it is unit-independent.
+- The What-If Simulator assumes constant income, expenses and return, and does not model taxes, inflation or market risk.
 - This is a decision-support tool, not financial advice.
 """
     )
@@ -343,6 +476,7 @@ def page_about():
 PAGES = {
     "Overview": page_overview,
     "My Financial Health": page_health,
+    "What-If Simulator": page_whatif,
     "Spending Forecast": page_forecast,
     "Customer Segments": page_segments,
     "About & Methodology": page_about,
