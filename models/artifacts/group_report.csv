@@ -1,0 +1,27 @@
+model,dimension,group,n,accuracy,macro_f1
+Logistic regression,employment,informal,7506,0.813,0.822
+Logistic regression,employment,salaried,13408,0.903,0.868
+Logistic regression,employment,self_employed,9086,0.891,0.872
+Logistic regression,income band,10k-20k,5814,0.826,0.833
+Logistic regression,income band,1L-2L,1791,0.902,0.864
+Logistic regression,income band,20k-50k,13996,0.879,0.862
+Logistic regression,income band,2L-4L,215,0.847,0.783
+Logistic regression,income band,50k-1L,8184,0.906,0.872
+Logistic regression,loan status,has loan,16078,0.861,0.86
+Logistic regression,loan status,no loan,13922,0.896,0.773
+Logistic regression,city tier,Tier 1,10526,0.873,0.858
+Logistic regression,city tier,Tier 2,10444,0.88,0.864
+Logistic regression,city tier,Tier 3,9030,0.879,0.859
+Random forest,employment,informal,7506,0.815,0.822
+Random forest,employment,salaried,13408,0.89,0.85
+Random forest,employment,self_employed,9086,0.892,0.869
+Random forest,income band,10k-20k,5814,0.824,0.829
+Random forest,income band,1L-2L,1791,0.902,0.857
+Random forest,income band,20k-50k,13996,0.871,0.853
+Random forest,income band,2L-4L,215,0.833,0.781
+Random forest,income band,50k-1L,8184,0.901,0.864
+Random forest,loan status,has loan,16078,0.848,0.848
+Random forest,loan status,no loan,13922,0.899,0.759
+Random forest,city tier,Tier 1,10526,0.871,0.854
+Random forest,city tier,Tier 2,10444,0.871,0.851
+Random forest,city tier,Tier 3,9030,0.875,0.853

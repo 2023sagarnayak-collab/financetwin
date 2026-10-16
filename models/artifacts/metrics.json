@@ -1,0 +1,64 @@
+{
+  "models": {
+    "Logistic regression": {
+      "cv_macro_f1_mean": 0.862,
+      "cv_macro_f1_std": 0.002,
+      "test_accuracy": 0.877,
+      "test_macro_f1": 0.86
+    },
+    "Random forest": {
+      "cv_macro_f1_mean": 0.856,
+      "cv_macro_f1_std": 0.002,
+      "test_accuracy": 0.872,
+      "test_macro_f1": 0.853
+    }
+  },
+  "reference": {
+    "Majority-class baseline": {
+      "test_accuracy": 0.6,
+      "test_macro_f1": 0.25
+    }
+  },
+  "selected": "Logistic regression",
+  "selection_reason": "Highest cross-validated macro-F1 on the training data (gap 0.006 over Random forest).",
+  "confusion_matrix": [
+    [
+      16043,
+      1957,
+      0
+    ],
+    [
+      675,
+      6211,
+      614
+    ],
+    [
+      0,
+      435,
+      4065
+    ]
+  ],
+  "class_order": [
+    "Stable",
+    "Stretched",
+    "Distressed"
+  ],
+  "importance": {
+    "credit_utilization": 0.2363,
+    "emi_to_salary": 0.2187,
+    "debt_to_income": 0.1896,
+    "is_informal": 0.101,
+    "expense_to_salary": 0.0239,
+    "is_self_employed": 0.0213,
+    "surplus_k": 0.0158,
+    "log_salary": 0.0058,
+    "emergency_fund_months": 0.0056,
+    "investment_to_salary": -0.0,
+    "is_metro": -0.0001,
+    "age": -0.0002,
+    "dependents": -0.0003,
+    "loan_count": -0.0004
+  },
+  "train_rows": 120000,
+  "test_rows": 30000
+}

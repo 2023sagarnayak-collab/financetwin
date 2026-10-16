@@ -1,473 +1,319 @@
+import json
 import os
 import sys
 
 import altair as alt
-import numpy as np
+import joblib
 import pandas as pd
 import streamlit as st
-from sklearn.cluster import KMeans
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT)
-from models.health_score import engineer_features, compute_health_score
-from engine.recommender import generate_recommendations
-from engine.whatif import run_scenario, project_balance
+from models.features import build_features, FEATURES, RAW_COLUMNS, CLASSES, EMPLOYMENT_TYPES
 
-PROCESSED_DIR = os.path.join(ROOT, "data", "processed")
+DATA_PATH = os.path.join(ROOT, "data", "processed", "india_households.csv")
+ART_DIR = os.path.join(ROOT, "models", "artifacts")
 
 st.set_page_config(page_title="FinanceTwin", page_icon="📊", layout="wide")
 
-# Same weights as models/health_score.py
-WEIGHTS = {
-    "Debt-to-income": 0.45,
-    "EMI burden": 0.35,
-    "Savings rate": 0.10,
-    "Investment ratio": 0.05,
-    "Credit utilization": 0.05,
+LABELS = {
+    "debt_to_income": "Debt-to-income (loan balance / yearly income)",
+    "emi_to_salary": "EMI burden (EMI / salary, borrowers)",
+    "credit_utilization": "Credit card utilisation",
+    "expense_to_salary": "Living expenses / salary",
+    "emergency_fund_months": "Emergency savings (months of expenses)",
+    "investment_to_salary": "Investment / salary",
+    "dependents": "Dependents",
+    "is_metro": "Metro city (Tier 1)",
+    "age": "Age",
+    "log_salary": "Monthly salary (log scale)",
+    "loan_count": "Number of loans",
+    "is_self_employed": "Self-employed",
+    "is_informal": "Informal or daily-wage work",
+    "surplus_k": "Monthly surplus after expenses and EMI (₹10,000s)",
+}
+
+HIGHER_IS_WORSE = {"debt_to_income", "emi_to_salary", "credit_utilization", "expense_to_salary", "is_informal"}
+LOWER_IS_WORSE = {"emergency_fund_months", "investment_to_salary", "surplus_k"}
+
+ADVICE = {
+    "debt_to_income": "Your loan balance is high relative to your yearly income. Prioritise repaying the most expensive loan first.",
+    "emi_to_salary": "EMIs take a large share of your salary. Look at refinancing or prepaying the costliest loan.",
+    "credit_utilization": "You are using a large share of your credit limit. Bringing card balances below 30% helps.",
+    "expense_to_salary": "Living costs take most of your salary. Review fixed costs first.",
+    "emergency_fund_months": "Your emergency savings cover few months of expenses. A common target is 3 to 6 months.",
+    "investment_to_salary": "Little is being invested. A small regular investment can start once the emergency fund is in place.",
+    "surplus_k": "Little is left after expenses and EMIs each month. Cutting one fixed cost or one EMI would widen your cushion.",
 }
 
 
-# ---------- data loading ----------
-@st.cache_data
-def load_scored_data():
-    credit = pd.read_csv(os.path.join(PROCESSED_DIR, "credit_clean.csv"))
-    credit = engineer_features(credit)
-    return compute_health_score(credit)
+# ---------- loading ----------
+@st.cache_resource
+def load_model():
+    return joblib.load(os.path.join(ART_DIR, "health_model.joblib"))
 
 
 @st.cache_data
-def load_rfm_clusters():
-    rfm = pd.read_csv(os.path.join(PROCESSED_DIR, "customer_clustered.csv"))
-
-    feat = pd.DataFrame({
-        "Recency": rfm["Recency"],
-        "Frequency": np.log1p(rfm["Frequency"]),
-        "Monetary": np.log1p(rfm["Monetary"]),
-    })
-    means, stds = feat.mean(), feat.std()
-    scaled = (feat - means) / stds
-
-    model = KMeans(n_clusters=2, random_state=42, n_init=10)
-    rfm["cluster"] = model.fit_predict(scaled)
-
-    # Label by behaviour, not by cluster number
-    active_id = rfm.groupby("cluster")["Monetary"].mean().idxmax()
-    rfm["segment"] = np.where(rfm["cluster"] == active_id, "Active / Engaged", "Lapsed / One-time")
-    return rfm, model, means, stds, active_id
+def load_metrics():
+    with open(os.path.join(ART_DIR, "metrics.json")) as f:
+        return json.load(f)
 
 
-# ---------- helpers ----------
-def normalize_against(value, reference, invert=False):
-    lo, hi = reference.quantile(0.01), reference.quantile(0.99)
-    scaled = float(np.clip((value - lo) / (hi - lo), 0, 1))
-    return 1 - scaled if invert else scaled
+@st.cache_data
+def load_group_report():
+    return pd.read_csv(os.path.join(ART_DIR, "group_report.csv"))
 
 
-def score_user(income, salary, debt, balance, invested, emi, credit_util, data):
-    metrics = {
-        "debt_to_income": debt / income,
-        "emi_burden": emi / salary,
-        "savings_rate": balance / salary,
-        "investment_ratio": invested / salary,
-        "credit_utilization": credit_util / 100,
-    }
-    sub = {
-        "Debt-to-income": normalize_against(metrics["debt_to_income"], data["debt_to_income"], invert=True),
-        "EMI burden": normalize_against(metrics["emi_burden"], data["emi_burden"], invert=True),
-        "Savings rate": normalize_against(metrics["savings_rate"], data["savings_rate"]),
-        "Investment ratio": normalize_against(metrics["investment_ratio"], data["investment_ratio"]),
-        "Credit utilization": normalize_against(metrics["credit_utilization"], data["credit_utilization"], invert=True),
-    }
-    score = sum(sub[k] * WEIGHTS[k] for k in sub) * 100
-    return metrics, sub, score
+@st.cache_data
+def load_error_diagnosis():
+    return pd.read_csv(os.path.join(ART_DIR, "group_error_diagnosis.csv"))
 
 
-def fmt_duration(months):
-    if months is None:
-        return "Not reachable"
-    years, rem = divmod(int(months), 12)
-    if years == 0:
-        return f"{rem} mo"
-    if rem == 0:
-        return f"{years} yr"
-    return f"{years} yr {rem} mo"
+@st.cache_data
+def load_stable_medians():
+    raw = pd.read_csv(DATA_PATH)
+    feats = build_features(raw)[FEATURES]
+    stable = raw["health_class"] == "Stable"
+    borrower = raw["monthly_emi"] > 0
+
+    med = feats[stable].median()
+    # Loan factors are compared with Stable households that have a loan
+    loan_cols = ["debt_to_income", "emi_to_salary"]
+    med[loan_cols] = feats.loc[stable & borrower, loan_cols].median()
+    return med
 
 
-def fmt_money_delta(value):
-    sign = "+" if value >= 0 else "-"
-    return f"{sign}₹{abs(value):,.0f}"
+# ---------- model call ----------
+def predict(profile: dict):
+    """One entry point for every part of the page: profile in, class and probabilities out."""
+    model = load_model()
+    X = build_features(pd.DataFrame([profile])[RAW_COLUMNS])[FEATURES]
+    raw = model.predict_proba(X)[0]
+    order = list(model.classes_)
+    probs = {c: float(raw[order.index(c)]) for c in CLASSES}
+    return max(probs, key=probs.get), probs, X.iloc[0]
+
+
+def is_worse(feature, value, typical, tolerance=0.10):
+    if feature in HIGHER_IS_WORSE:
+        return value > typical * (1 + tolerance)
+    if feature in LOWER_IS_WORSE:
+        return value < typical * (1 - tolerance)
+    return False
+
+
+def driver_table(x, top_n=4):
+    stable = load_stable_medians()
+    importance = load_metrics()["importance"]
+    top = [f for f in importance if f in FEATURES][:top_n]
+    rows = []
+    for f in top:
+        rows.append({
+            "Factor": LABELS[f],
+            "Your value": round(float(x[f]), 2),
+            "Typical Stable household": round(float(stable[f]), 2),
+            "Status": "Worse than typical" if is_worse(f, x[f], stable[f]) else "In line",
+        })
+    return pd.DataFrame(rows)
+
+
+def advice(x):
+    stable = load_stable_medians()
+    msgs = [ADVICE[f] for f in FEATURES if f in ADVICE and is_worse(f, x[f], stable[f])]
+    return msgs or ["No factor is worse than a typical Stable household. Keep checking as your situation changes."]
+
+
+def prob_chart(probs):
+    df = pd.DataFrame({"Class": CLASSES, "Probability": [probs[c] for c in CLASSES]})
+    return alt.Chart(df).mark_bar().encode(
+        x=alt.X("Probability:Q", scale=alt.Scale(domain=[0, 1]), axis=alt.Axis(format="%")),
+        y=alt.Y("Class:N", sort=CLASSES, title=None),
+        tooltip=["Class", alt.Tooltip("Probability:Q", format=".1%")],
+    )
 
 
 # ---------- pages ----------
 def page_overview():
     st.title("FinanceTwin")
-    st.subheader("An intelligent personal financial planning and decision support system")
+    st.subheader("A supervised model for household financial health in India")
     st.write(
-        "Most budgeting apps only record what you already spent. FinanceTwin looks forward: "
-        "it scores your financial health, tests goals with what-if scenarios, forecasts "
-        "spending, groups spending behaviour, and suggests what to improve."
+        "Enter one household profile. A trained model predicts whether the household is Stable, "
+        "Stretched or Distressed, explains which factors drive that prediction, and shows how "
+        "changes would shift it."
+    )
+    m = load_metrics()
+    a, b, c = st.columns(3)
+    a.metric("Households in training data", f"{m['train_rows'] + m['test_rows']:,}")
+    b.metric("Selected model", m["selected"])
+    c.metric("Macro-F1 on held-out test set", f"{m['models'][m['selected']]['test_macro_f1']:.2f}")
+    st.info(
+        "The training data is synthetic, built from assumptions about Indian households. Accuracy "
+        "shows how well the method recovers the labelling rule, not performance on real "
+        "households. See About & Evidence."
     )
 
-    data = load_scored_data()
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Users scored", f"{len(data):,}")
-    m2.metric("Average Health Score", f"{data['health_score'].mean():.1f}")
-    m3.metric("Median Health Score", f"{data['health_score'].median():.1f}")
 
-    st.subheader("How Health Scores are spread across all users")
-    counts, edges = np.histogram(data["health_score"], bins=25, range=(0, 100))
-    hist = pd.DataFrame({"start": edges[:-1], "end": edges[1:], "Users": counts})
-    chart = alt.Chart(hist).mark_bar().encode(
-        x=alt.X("start:Q", title="Health Score", scale=alt.Scale(domain=[0, 100])),
-        x2="end:Q",
-        y=alt.Y("Users:Q", title="Number of users"),
-        tooltip=["start", "end", "Users"],
-    )
-    st.altair_chart(chart)
-
-    st.subheader("What you can do here")
-    cards = [
-        ("My Financial Health", "Enter your numbers, get your score, and see personalised suggestions."),
-        ("What-If Simulator", "Set a savings goal and see how income, spending or saving changes affect the time to reach it."),
-        ("Spending Forecast", "See past monthly spending and a projection of the next months."),
-        ("Customer Segments", "See how customers split into active and lapsed spending groups."),
-        ("About & Methodology", "Datasets, validation results and honest limitations."),
-    ]
-    slots = st.columns(3) + st.columns(3)
-    for slot, (title, text) in zip(slots, cards):
-        with slot.container(border=True):
-            st.markdown(f"**{title}**")
-            st.write(text)
-
-
-def page_health():
-    st.title("My Financial Health")
-    st.write("Enter your monthly figures in rupees. Your score and suggestions update as you change a value.")
-    st.caption(
-        "The score is built from ratios (for example debt divided by income), "
-        "so it does not depend on the currency you use."
-    )
-    data = load_scored_data()
+def page_check():
+    st.title("Financial Check")
+    st.write("Enter your household figures in rupees. The same model answers every question on this page.")
 
     left, right = st.columns([1, 1.2], gap="large")
-
     with left:
-        st.subheader("Your numbers")
-        st.markdown("**Income**")
-        income = st.slider("Annual income (₹)", 100000, 3000000, 600000, step=10000)
-        salary = st.slider("Monthly in-hand salary (₹)", 5000, 250000, 40000, step=1000)
-        st.markdown("**Debt**")
-        debt = st.slider("Outstanding debt (₹)", 0, 2000000, 50000, step=10000)
-        emi = st.slider("Total EMI per month (₹)", 0, 150000, 8000, step=1000)
-        credit_util = st.slider("Credit utilization (%)", 0, 100, 25)
-        st.markdown("**Savings and investing**")
-        balance = st.slider("Monthly balance left over (₹)", 0, 100000, 15000, step=1000)
-        invested = st.slider("Invested per month (₹)", 0, 50000, 5000, step=500)
+        st.subheader("Your household")
+        salary = st.slider("Monthly in-hand salary (₹)", 10000, 400000, 40000, step=1000)
+        employment = st.selectbox("Type of work", EMPLOYMENT_TYPES,
+                                  format_func=lambda e: e.replace("_", " ").capitalize())
+        loans = st.slider("Number of loans", 0, 3, 1)
+        expenses = st.slider("Monthly living expenses, excluding EMI (₹)", 0, 250000, 22000, step=1000)
+        emi = st.slider("Total EMI per month (₹)", 0, 150000, 8000, step=500)
+        debt = st.slider("Outstanding loan balance (₹)", 0, 5000000, 300000, step=10000)
+        util = st.slider("Credit card utilisation (%)", 0, 100, 25)
+        emergency = st.slider("Emergency savings (months of expenses)", 0.0, 24.0, 3.0, step=0.5)
+        invest = st.slider("Invested per month (₹)", 0, 100000, 4000, step=500)
+        age = st.slider("Age", 21, 59, 35)
+        dependents = st.slider("Dependents", 0, 4, 2)
+        tier = st.radio("City tier", [1, 2, 3], index=1, horizontal=True,
+                        format_func=lambda t: f"Tier {t}")
+        st.caption("Results are most reliable within the ranges of the training data.")
 
-    metrics, sub, score = score_user(income, salary, debt, balance, invested, emi, credit_util, data)
-    pct = float((data["health_score"] < score).mean() * 100)
+    profile = {
+        "monthly_salary": salary,
+        "annual_income": salary * 12,
+        "monthly_expenses": expenses,
+        "monthly_emi": emi,
+        "outstanding_debt": debt,
+        "credit_utilization_pct": util,
+        "emergency_fund_months": emergency,
+        "monthly_investment": invest,
+        "dependents": dependents,
+        "city_tier": tier,
+        "age": age,
+        "loan_count": loans,
+        "employment_type": employment,
+    }
+    cls, probs, x = predict(profile)
 
     with right:
-        st.subheader("Your results")
-        r1, r2 = st.columns(2)
-        r1.metric("Health Score", f"{score:.0f} / 100")
-        r2.metric("Better than", f"{pct:.0f}% of users")
-        st.progress(min(max(score, 0), 100) / 100)
-
-        if pct >= 75:
-            st.success("Strong: your finances look healthier than most users in the dataset.")
-        elif pct >= 25:
-            st.info("Moderate: you are around the middle of the pack.")
+        st.subheader("Prediction")
+        st.metric("Predicted financial-health class", cls)
+        st.altair_chart(prob_chart(probs))
+        if cls == "Stable":
+            st.success("This household's profile looks Stable.")
+        elif cls == "Stretched":
+            st.warning("This household's profile looks Stretched: some pressure, but not yet critical.")
         else:
-            st.warning("Needs attention: your score is in the lowest quarter of users.")
+            st.error("This household's profile looks Distressed: repayments and savings are under serious strain.")
+        st.caption("Model-based estimate from synthetic data. Not financial advice.")
 
-        st.markdown("**How you score on each factor** (higher is better)")
-        breakdown = pd.DataFrame({
-            "Factor": list(sub),
-            "Score": [round(v * 100, 1) for v in sub.values()],
-            "Weight": [f"{WEIGHTS[k]:.0%}" for k in sub],
-        })
-        bars = alt.Chart(breakdown).mark_bar().encode(
-            x=alt.X("Score:Q", scale=alt.Scale(domain=[0, 100]), title="Score (0-100)"),
-            y=alt.Y("Factor:N", sort="-x", title=None),
-            tooltip=["Factor", "Score", "Weight"],
-        )
-        st.altair_chart(bars)
-        st.caption(
-            "Debt-to-income and EMI burden carry 80% of the total weight because they were the "
-            "factors that best separated good from poor credit in the data."
-        )
+        st.subheader("What is driving this")
+        st.table(driver_table(x))
 
-        st.markdown("**Personalised suggestions**")
-        for rec in generate_recommendations(metrics):
-            text = f"**{rec['title']}**\n\n{rec['message']}"
-            priority = rec.get("priority")
-            if priority is None:
-                st.success(text)
-            elif priority <= 2:
-                st.warning(text)
-            else:
-                st.info(text)
+        st.subheader("Suggestions")
+        for msg in advice(x):
+            st.info(msg)
 
-
-def page_whatif():
-    st.title("What-If Simulator")
-    st.write(
-        "Set a savings goal, then change income, spending or how much you save, and see how "
-        "long the goal takes. Amounts are in rupees."
-    )
-
-    st.subheader("Your situation and goal")
-    c1, c2 = st.columns(2, gap="large")
-    with c1:
-        income = st.number_input("Monthly income (₹)", min_value=0, value=60000, step=1000)
-        expenses = st.number_input("Monthly living expenses, excluding EMI (₹)", min_value=0, value=30000, step=1000)
-        emi = st.number_input("Monthly EMI (₹)", min_value=0, value=8000, step=500)
-    with c2:
-        goal = st.number_input("Goal amount (₹)", min_value=1000, value=500000, step=10000)
-        current = st.number_input("Already saved towards this goal (₹)", min_value=0, value=50000, step=5000)
-        allocation = st.slider("Share of monthly surplus put towards the goal (%)", 0, 100, 70)
-    annual_return = st.slider(
-        "Expected yearly return (%)", 0.0, 15.0, 6.0, step=0.5,
-        help="Enter a return after inflation if you want the goal read in today's rupees.",
-    )
-
+    st.divider()
     st.subheader("What if...?")
-    w1, w2 = st.columns(2, gap="large")
-    with w1:
-        d_income = st.slider("Change in income (%)", -50, 100, 10)
-        d_expense = st.slider("Change in living expenses (%)", -50, 50, 0)
-    with w2:
-        d_alloc = st.slider("Change in share of surplus saved (percentage points)", -50, 50, 0)
-        d_return = st.slider("Change in expected return (percentage points)", -5.0, 5.0, 0.0, step=0.5)
+    st.caption("The same model re-scores the household after each change.")
+    w1, w2, w3, w4 = st.columns(4)
+    d_sal = w1.slider("Change in salary (%)", -50, 50, 0)
+    d_exp = w2.slider("Change in expenses (%)", -50, 50, 0)
+    d_emi = w3.slider("Change in EMI (₹)", -20000, 20000, 0, step=500)
+    d_sav = w4.slider("Change in emergency savings (months)", -3.0, 6.0, 0.0, step=0.5)
 
-    scn_income = income * (1 + d_income / 100)
-    scn_expenses = expenses * (1 + d_expense / 100)
-    scn_alloc = min(max(allocation + d_alloc, 0), 100)
-    scn_return = max(annual_return + d_return, 0.0)
-
-    base = run_scenario(income, expenses, emi, allocation / 100, annual_return / 100, current, goal)
-    scn = run_scenario(scn_income, scn_expenses, emi, scn_alloc / 100, scn_return / 100, current, goal)
-
-    if base["surplus"] <= 0:
-        st.warning("With today's numbers, expenses and EMI use up all of your income, so nothing is left to save.")
-    if scn["surplus"] <= 0:
-        st.warning("In the what-if plan, expenses and EMI use up all of your income, so nothing is left to save.")
-
-    st.subheader("Results")
-    r1, r2, r3 = st.columns(3)
-    r1.metric("Time to goal: today's plan", fmt_duration(base["months"]))
-    delta = None
-    if base["months"] is not None and scn["months"] is not None:
-        delta = f"{scn['months'] - base['months']:+d} months"
-    r2.metric("Time to goal: what-if plan", fmt_duration(scn["months"]), delta=delta, delta_color="inverse")
-    r3.metric(
-        "Saved towards goal each month (what-if)",
-        f"₹{scn['contribution']:,.0f}",
-        delta=fmt_money_delta(scn["contribution"] - base["contribution"]),
+    scenario = dict(
+        profile,
+        monthly_salary=salary * (1 + d_sal / 100),
+        annual_income=salary * (1 + d_sal / 100) * 12,
+        monthly_expenses=expenses * (1 + d_exp / 100),
+        monthly_emi=max(emi + d_emi, 0),
+        emergency_fund_months=max(emergency + d_sav, 0.0),
     )
+    s_cls, s_probs, _ = predict(scenario)
 
-    if base["months"] is None and scn["months"] is None:
-        st.error("Neither plan reaches the goal within 50 years. Try a larger surplus, a smaller goal or a higher return.")
-    elif base["months"] is None:
-        st.success(f"The what-if plan makes the goal reachable, in {fmt_duration(scn['months'])}.")
-    elif scn["months"] is None:
-        st.error("The what-if plan no longer reaches the goal within 50 years.")
-    else:
-        diff = base["months"] - scn["months"]
-        if diff > 0:
-            st.success(f"The what-if plan reaches the goal {fmt_duration(diff)} sooner.")
-        elif diff < 0:
-            st.warning(f"The what-if plan reaches the goal {fmt_duration(-diff)} later.")
-        else:
-            st.info("These changes make no difference to the time needed.")
-
-    candidates = [m for m in (base["months"], scn["months"]) if m]
-    horizon = int(max(candidates) * 1.2) + 6 if candidates else 120
-    horizon = min(max(horizon, 60), 600)
-
-    base_bal = project_balance(current, base["contribution"], annual_return / 100, horizon)
-    scn_bal = project_balance(current, scn["contribution"], scn_return / 100, horizon)
-
-    chart_df = pd.DataFrame({
-        "Years": [m / 12 for m in range(horizon + 1)],
-        "Today's plan": base_bal,
-        "What-if plan": scn_bal,
-    }).melt("Years", var_name="Plan", value_name="Balance")
-
-    lines = alt.Chart(chart_df).mark_line().encode(
-        x=alt.X("Years:Q", title="Years from now"),
-        y=alt.Y("Balance:Q", title="Savings towards goal (₹)"),
-        color=alt.Color("Plan:N", title=None),
-        tooltip=[
-            alt.Tooltip("Years:Q", format=".1f"),
-            "Plan:N",
-            alt.Tooltip("Balance:Q", format=",.0f"),
-        ],
-    )
-    goal_line = alt.Chart(pd.DataFrame({"Goal": [goal]})).mark_rule(
-        color="gray", strokeDash=[6, 4]
-    ).encode(y="Goal:Q")
-    st.altair_chart(lines + goal_line)
-    st.caption(
-        f"The dashed line is your goal. Balance after 5 years: ₹{base_bal[60]:,.0f} "
-        f"(today's plan) vs ₹{scn_bal[60]:,.0f} (what-if plan)."
-    )
-
-    with st.expander("How this is calculated"):
-        st.markdown(
-            """
-- Monthly surplus = income - living expenses - EMI.
-- Amount saved each month = surplus x the share you put towards the goal.
-- Each month the balance grows by the expected return (yearly rate divided by 12), then the monthly amount is added.
-- Income, expenses and EMI are assumed constant. Taxes, market ups and downs and inflation are not modelled, so enter a return after inflation to read results in today's rupees.
-- This is an illustration based on your inputs, not a prediction or financial advice.
-"""
-        )
-
-
-def page_forecast():
-    st.title("Spending Forecast")
-    try:
-        from models.forecasting import load_monthly_series, forecast_future
-    except ImportError as e:
-        st.error(
-            f"Forecasting needs the 'statsmodels' package ({e}). Start the app from your "
-            "virtual environment with: python -m streamlit run dashboard/app.py"
-        )
-        return
-
-    st.write("Monthly spending from the personal budget dataset, with a simple projection.")
-    st.caption("Amounts are in the dataset's own units; its currency is not specified.")
-    periods = st.slider("Months to forecast", 1, 6, 3)
-
-    monthly = load_monthly_series()
-    future = forecast_future(monthly, periods=periods)
-
-    def naive(index):
-        return pd.DatetimeIndex(index).tz_localize(None)
-
-    actual = pd.DataFrame({"Month": naive(monthly.index), "Spend": monthly.values, "Type": "Actual"})
-    bridge = pd.DataFrame({"Month": [actual["Month"].iloc[-1]], "Spend": [monthly.iloc[-1]], "Type": "Forecast"})
-    fc = pd.DataFrame({"Month": naive(future.index), "Spend": future.values, "Type": "Forecast"})
-    plot_df = pd.concat([actual, bridge, fc], ignore_index=True)
-
-    line = alt.Chart(plot_df).mark_line(point=True).encode(
-        x=alt.X("Month:T", title=None),
-        y=alt.Y("Spend:Q", title="Monthly spend (dataset units)"),
-        color=alt.Color("Type:N", title=None),
-        tooltip=["Month:T", "Spend:Q", "Type:N"],
-    )
-    st.altair_chart(line)
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Forecast per month", f"{future.iloc[0]:,.0f}")
-    m2.metric("Average of last 6 months", f"{monthly.iloc[-6:].mean():,.0f}")
-    m3.metric("Highest month on record", f"{monthly.max():,.0f}")
-
-    st.info(
-        "The forecast is flat on purpose. Backtesting showed this spending has no reliable "
-        "trend, so the best estimate is a smoothed recent level."
-    )
-
-    with st.expander("How accurate is this forecast?"):
-        st.write(
-            "Each method was trained on all but the last 6 months and tested on those 6 months. "
-            "Lower error is better."
-        )
-        backtest = pd.DataFrame({
-            "Method": ["Naive (repeat last month)", "Smoothing, no trend (used here)",
-                       "Smoothing with trend", "3-month moving average"],
-            "Error (RMSE)": [674.57, 688.04, 1260.55, 1518.17],
-        })
-        st.table(backtest.set_index("Method"))
-        st.write(
-            "No method beat the naive baseline. Individual monthly spending is noisy, so a "
-            "forecast here is indicative only."
-        )
-
-
-def page_segments():
-    st.title("Customer Spending Segments")
-    st.write(
-        "Customers are grouped by three behaviours (RFM): **Recency** (days since last purchase), "
-        "**Frequency** (number of orders) and **Monetary** (total spend). This uses a separate "
-        "retail dataset with real repeat purchases."
-    )
-    st.caption("Spend amounts are in the retail dataset's own units, so they are not rupees.")
-    rfm, model, means, stds, active_id = load_rfm_clusters()
-
-    counts = rfm["segment"].value_counts()
     c1, c2 = st.columns(2)
-    c1.metric("Active / Engaged customers", f"{counts.get('Active / Engaged', 0):,}")
-    c2.metric("Lapsed / One-time customers", f"{counts.get('Lapsed / One-time', 0):,}")
-
-    summary = rfm.groupby("segment").agg(**{
-        "Avg days since last purchase": ("Recency", "mean"),
-        "Avg number of orders": ("Frequency", "mean"),
-        "Avg total spend (dataset units)": ("Monetary", "mean"),
-    }).round(1)
-    st.table(summary)
-
-    st.subheader("Where customers sit")
-    sample = rfm.sample(min(len(rfm), 3000), random_state=42)[["Recency", "Frequency", "Monetary", "segment"]]
-    scatter = alt.Chart(sample).mark_circle(size=40, opacity=0.5).encode(
-        x=alt.X("Recency:Q", title="Days since last purchase"),
-        y=alt.Y("Monetary:Q", scale=alt.Scale(type="log"), title="Total spend (dataset units, log scale)"),
-        color=alt.Color("segment:N", title="Segment"),
-        tooltip=["Recency", "Frequency", "Monetary", "segment"],
+    c1.metric("Predicted class (what-if)", s_cls, delta=None if s_cls == cls else f"was {cls}")
+    c2.metric(
+        "Chance of Distressed (what-if)",
+        f"{s_probs['Distressed']:.0%}",
+        delta=f"{(s_probs['Distressed'] - probs['Distressed']) * 100:+.0f} points",
+        delta_color="inverse",
     )
-    st.altair_chart(scatter)
-    st.caption("Random sample of 3,000 customers. The spend axis is logarithmic because a few customers spend far more than the rest.")
-
-    st.subheader("Classify a customer")
-    a, b, c = st.columns(3)
-    with a:
-        recency = st.slider("Days since last purchase", 1, 740, 90)
-    with b:
-        frequency = st.number_input("Number of orders", min_value=1, max_value=400, value=5)
-    with c:
-        monetary = st.number_input("Total spend (dataset units)", min_value=1, max_value=1000000, value=1000, step=100)
-
-    row = pd.DataFrame([{
-        "Recency": recency,
-        "Frequency": np.log1p(frequency),
-        "Monetary": np.log1p(monetary),
-    }])
-    cluster = model.predict((row - means) / stds)[0]
-    if cluster == active_id:
-        st.success("Predicted segment: **Active / Engaged**. Recent, frequent and higher-spending behaviour.")
-    else:
-        st.warning("Predicted segment: **Lapsed / One-time**. Long gap since last purchase, few orders, lower spend.")
 
 
 def page_about():
-    st.title("About & Methodology")
+    st.title("About & Evidence")
+    m = load_metrics()
+    groups_all = load_group_report()
+    groups = groups_all[groups_all["model"] == m["selected"]]
+
+    def group_value(dim, grp, col):
+        return groups.loc[(groups["dimension"] == dim) & (groups["group"] == grp), col].iloc[0]
+
+    informal_acc = group_value("employment", "informal", "accuracy")
+    top_band_n = int(group_value("income band", "2L-4L", "n"))
+
     st.markdown(
         """
-**FinanceTwin** combines finance concepts with data science to move beyond expense tracking.
+**FinanceTwin** is a supervised model that reads a household's finances and predicts whether it is Stable, Stretched or Distressed.
 
-### Modules and datasets
-| Module | Data used | Method |
-|---|---|---|
-| Financial Health Score | Credit score classification dataset (Kaggle) | Weighted score from debt, EMI, savings, investment and credit-use ratios |
-| What-If Simulator | User inputs only | Month-by-month compound-growth projection towards a savings goal |
-| Spending forecast | Personal budget transactions (Kaggle) | Exponential smoothing, backtested against baselines |
-| Customer segments | Online Retail II (Kaggle) | RFM features, log-scaling, k-means |
-| Recommendations | Output of the Health Score | Transparent rule-based thresholds |
+### How the model was built
+1. **Data:** 150,000 synthetic Indian households. Salaries range from ₹10,000 to ₹4,00,000 a month, with salaried, self-employed and informal workers, zero to three loans, and three city tiers. The health label comes from a documented risk formula plus noise.
+2. **Definition of financial health:** the label combines two measures. The first is burden relative to income: EMI, debt and credit use as shares of salary or income. The second is the rupee cushion left after expenses and EMI, because that cushion determines whether a household can absorb a shock. Both are our assumptions about what financial health means, not estimates from data.
+3. **Features:** 14 ratios and attributes, built by one shared function that both training and the app use.
+4. **Models:** two candidates, logistic regression and random forest.
+5. **Selection:** both were scored with five-fold cross-validation on the training split only, using macro-F1.
+6. **Final check:** the 20% held-out test set was used once, after selection.
+"""
+    )
 
-### Key findings
-- **Health Score validation:** average scores follow the real credit labels (Good about 82, Standard about 79, Poor about 75). Debt-to-income and EMI burden were the factors that separated these groups; savings, investment and credit utilization were weak in this dataset.
-- **Forecasting:** no method beat the naive "repeat last month" baseline. Individual monthly spending is noisy with one-off spikes.
-- **Segmentation:** a first dataset with one transaction per customer showed no link between age and spend, so it was replaced by retail data with repeat purchases.
+    st.subheader("Model comparison")
+    rows = {}
+    for name, r in m["models"].items():
+        rows[name] = {
+            "CV macro-F1": f"{r['cv_macro_f1_mean']:.3f} ± {r['cv_macro_f1_std']:.3f}",
+            "Test accuracy": r["test_accuracy"],
+            "Test macro-F1": r["test_macro_f1"],
+        }
+    base = m["reference"]["Majority-class baseline"]
+    rows["Majority-class baseline (reference only)"] = {
+        "CV macro-F1": "n/a",
+        "Test accuracy": base["test_accuracy"],
+        "Test macro-F1": base["test_macro_f1"],
+    }
+    st.table(pd.DataFrame(rows).T)
+    st.success(f"**Selected: {m['selected']}.** {m['selection_reason']}")
+
+    st.subheader("Confusion matrix on the test set (rows: actual, columns: predicted)")
+    cm = pd.DataFrame(m["confusion_matrix"], index=m["class_order"], columns=m["class_order"])
+    st.table(cm)
+
+    st.subheader("Performance by household type (test set, selected model)")
+    st.caption("Accuracy is the more reliable measure for small groups. Macro-F1 is unstable when a group has few cases of one class.")
+    st.table(groups.drop(columns="model").set_index(["dimension", "group"]))
+
+    st.subheader("Where the errors fall (training split, cross-validated)")
+    st.caption(
+        "A separate analysis on the training split, so these figures are not the test-set results above. "
+        "A neighbour error is one between adjacent classes (Stable and Stretched, or Stretched and Distressed)."
+    )
+    diag = load_error_diagnosis()
+    st.table(diag.set_index(["dimension", "group"])[
+        ["n", "accuracy", "errors", "neighbour_error_share", "stable_vs_distressed_errors"]
+    ])
+
+    st.markdown(
+        f"""
+### Income and the trade-off
+We tested three definitions of financial health. A ratio-only label gave overall test accuracy of 0.871, with informal-worker accuracy of 0.826. A buffer penalty for low salaries gave 0.869 overall but reduced informal accuracy to 0.797. The surplus definition used here gave 0.877 overall, with informal accuracy of 0.813 and accuracy of 0.826 for households earning under ₹20,000. Surplus improves overall accuracy compared with the ratio-only model, but it costs some accuracy for informal and low-income households. We report this trade-off instead of choosing the setting that looks best overall.
 
 ### Limitations
-- Datasets are public and partly synthetic, so results show the method works rather than describing real people.
-- About 18% of credit records were dropped because of missing salary values.
-- Weights and recommendation thresholds are design choices and can be tuned. They are calibrated to the benchmark dataset and would need recalibration for region-specific borrowing patterns.
-- Amounts on the Forecast and Segments pages are in the source datasets' own units (currency not standardised). The Health Score uses ratios, so it is unit-independent.
-- The What-If Simulator assumes constant income, expenses and return, and does not model taxes, inflation or market risk.
-- This is a decision-support tool, not financial advice.
+- **Synthetic data.** High accuracy shows the model recovers the labelling rule, not that it predicts real households.
+- **Definition is a choice.** The surplus term reflects our view of financial health. Real data would show whether it predicts outcomes.
+- **Informal households.** Accuracy for informal workers is {informal_acc:.1%}. In the training-split analysis, about 24% of Stable informal households are flagged as Stretched, against about 8% of salaried households.
+- **Boundary errors.** Almost all errors are between neighbouring classes. Only a handful are Stable versus Distressed.
+- **Thin top income band.** The ₹2L to ₹4L band has {top_band_n} test households, so its scores are unreliable.
+- **Decision support only.** This is a model-based estimate, not financial advice. Real validation needs household microdata, for example the MoSPI AIDIS 2019 unit-level data, and review by a qualified adviser.
 """
     )
 
@@ -475,11 +321,8 @@ def page_about():
 # ---------- navigation ----------
 PAGES = {
     "Overview": page_overview,
-    "My Financial Health": page_health,
-    "What-If Simulator": page_whatif,
-    "Spending Forecast": page_forecast,
-    "Customer Segments": page_segments,
-    "About & Methodology": page_about,
+    "Financial Check": page_check,
+    "About & Evidence": page_about,
 }
 
 st.sidebar.title("FinanceTwin")

@@ -1,0 +1,11 @@
+dimension,group,n,accuracy,errors,neighbour_error_share,stable_vs_distressed_errors
+employment,informal,29972,0.811,5656,1.0,0
+employment,salaried,53979,0.907,5013,1.0,0
+employment,self_employed,36049,0.89,3969,1.0,0
+income band,10k-20k,23358,0.818,4253,1.0,0
+income band,1L-2L,6871,0.9,685,1.0,0
+income band,20k-50k,56366,0.886,6409,1.0,0
+income band,2L-4L,934,0.876,116,1.0,0
+income band,50k-1L,32471,0.902,3175,1.0,0
+loan status,has loan,63738,0.863,8735,1.0,0
+loan status,no loan,56262,0.895,5903,1.0,0

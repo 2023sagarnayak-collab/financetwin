@@ -1,32 +1,28 @@
 # FinanceTwin
 
-An intelligent personal financial planning and decision support system, built for the B.Tech Data Science Interdisciplinary Project (DATA802).
+A supervised model that estimates the financial health of Indian households as Stable, Stretched or Distressed, with a Streamlit dashboard for individual checks.
 
-Most budgeting apps only record past spending. FinanceTwin looks forward: it scores financial health, forecasts spending, segments spending behaviour, and gives personalised suggestions.
+Built for the B.Tech (Hons) Data Science Interdisciplinary Project (DATA802).
 
-**Live demo:**  https://financetwin-qsfufrgfvi4ctw9sy28cxs.streamlit.app/
+**Live demo:** add the Streamlit link here after deployment
 
-## Features
+## What it does
 
-| Module | What it does | Method |
-|---|---|---|
-| Financial Health Score | Scores a user 0-100 and shows how each factor contributes | Weighted score from debt-to-income, EMI burden, savings, investment and credit-use ratios |
-| Spending Forecast | Projects monthly spending | Exponential smoothing, backtested against baselines |
-| Customer Segments | Groups customers into active and lapsed spenders | RFM features, log scaling, k-means |
-| Recommendations | Suggests what to improve | Transparent rule-based thresholds on raw ratios |
+- **Financial Check:** enter one household's figures, get a predicted class with probabilities, the factors driving it, suggestions, and a what-if view that re-runs the model.
+- **About & Evidence:** the two-model comparison, the selection rule, the confusion matrix, performance by household type, and the limitations.
 
-## Datasets (all public, from Kaggle)
+## Method
 
-- `parisrohan/credit-score-classification` for the Health Score
-- `ismetsemedov/personal-budget-transactions-dataset` for forecasting
-- `mashlyn/online-retail-ii-uci` for customer segments
-- `bkcoban/customer-transactions` was explored for segmentation, then replaced because each customer had only one transaction
+1. **Data:** 150,000 synthetic Indian households, generated from documented assumptions (`data/generate_indian_data.py`). Salaries range from ₹10,000 to ₹4,00,000 a month, with salaried, self-employed and informal workers, zero to three loans, and three city tiers. The label comes from a risk formula that combines burden relative to income with the rupee surplus left after expenses and EMI, plus noise.
+2. **Features:** 14 ratios and attributes, computed by one shared function (`models/features.py`) used in both training and the app.
+3. **Models:** logistic regression and random forest, compared with five-fold cross-validation on the training split. Logistic regression was selected.
+4. **Evaluation:** a held-out 20% test set, used once after selection. Performance is also reported by employment type, income band, loan status and city tier.
 
-## Key findings
+## Results
 
-- **Health Score:** average scores follow the real credit labels (Good about 82, Standard about 79, Poor about 75). Debt-to-income and EMI burden separated the groups best, so they carry 80% of the weight.
-- **Forecasting:** no method beat the naive "repeat last month" baseline, because individual monthly spending is noisy.
-- **Segmentation:** log-scaling RFM features removed the distortion from a few extreme wholesale buyers and gave two interpretable segments.
+On the held-out test set, the selected logistic regression reaches 0.877 accuracy (macro-F1 0.86), against 0.600 for a majority-class reference. Most errors fall between neighbouring classes. Accuracy is lower for informal workers (0.813) and households earning under ₹20,000 (0.826) than for salaried workers (0.903).
+
+These results describe how well the method recovers the labelling rule on synthetic data. They do not show performance on real households.
 
 ## Run locally
 
@@ -34,31 +30,35 @@ Most budgeting apps only record past spending. FinanceTwin looks forward: it sco
 python -m venv venv
 venv\Scripts\activate          # Windows
 pip install -r requirements.txt
+python data/generate_indian_data.py
+python models/train_model.py
+python models/diagnose_groups.py
 python -m streamlit run dashboard/app.py
 ```
 
-The processed data needed by the dashboard is included in `data/processed/`.
-
-### Rebuild the data from scratch (optional)
-
-1. Download the datasets into `data/raw/` with the Kaggle CLI, for example `kaggle datasets download -d <slug> -p data/raw --unzip`.
-2. Rename `11 march 2025.csv` to `budget_transactions.csv` and `sample_dataset.csv` to `customer_transactions.csv`.
-3. Run `python data/data_loader.py`, then `python models/clustering.py`.
+The generated data and trained model are included in `data/processed/` and `models/artifacts/`, so the dashboard runs without repeating the first three steps.
 
 ## Project structure
+data/
+generate_indian_data.py synthetic household generator
+processed/ generated dataset, and retired datasets
+models/
+features.py shared feature contract
+train_model.py model comparison, selection and evaluation
+diagnose_groups.py error analysis on the training split
+artifacts/ selected model, metrics and group reports
+health_score.py, forecasting.py, clustering.py exploratory, not used by the app
+engine/
+recommender.py exploratory, not used by the app
+dashboard/
+app.py Streamlit app
 
-```
-data/         data_loader.py and processed datasets
-models/       health_score.py, forecasting.py, clustering.py
-engine/       recommender.py
-dashboard/    app.py (Streamlit app)
-notebooks/    eda.ipynb
-```
 
 ## Limitations
 
-- Datasets are public and partly synthetic, so results show the method works rather than describing real people.
-- About 18% of credit records were dropped because of missing salary values.
-- Weights and thresholds are design choices calibrated to these datasets and would need recalibration for region-specific data.
-- Amounts on the Forecast and Segments pages are in the datasets' own units. The Health Score uses ratios, so it does not depend on currency.
+- The data is synthetic. Results show how well the method recovers its labelling rule, not how it performs on real households.
+- The financial-health definition is a modelling choice, not an estimate from data.
+- Errors are concentrated at the boundaries between neighbouring classes. Informal households receive more false alarms.
+- The top income band has too few test households for a reliable estimate.
+- Real validation needs household microdata, for example the MoSPI AIDIS 2019 unit-level data.
 - This is a decision-support tool, not financial advice.
