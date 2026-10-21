@@ -1,0 +1,4 @@
+segment,households,median_salary,median_emi_ratio,median_surplus,share_with_loan,share_informal,share_stable,share_stretched,share_distressed,share_of_households
+0,27924,17797.0,0.0,4240.0,0.36,0.96,0.44,0.41,0.15,0.233
+1,25992,42889.0,0.2,3970.0,1.0,0.12,0.15,0.34,0.51,0.217
+2,66084,47017.0,0.0,13771.0,0.42,0.0,0.84,0.15,0.01,0.551

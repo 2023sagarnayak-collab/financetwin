@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import sys
 
@@ -16,34 +17,41 @@ ART_DIR = os.path.join(ROOT, "models", "artifacts")
 
 st.set_page_config(page_title="FinanceTwin", page_icon="📊", layout="wide")
 
+# Plain-language names for the model's three classes
+DISPLAY = {"Stable": "On track", "Stretched": "Getting tight", "Distressed": "Under strain"}
+
+# Plain-language description of each factor
 LABELS = {
-    "debt_to_income": "Debt-to-income (loan balance / yearly income)",
-    "emi_to_salary": "EMI burden (EMI / salary, borrowers)",
-    "credit_utilization": "Credit card utilisation",
-    "expense_to_salary": "Living expenses / salary",
-    "emergency_fund_months": "Emergency savings (months of expenses)",
-    "investment_to_salary": "Investment / salary",
-    "dependents": "Dependents",
-    "is_metro": "Metro city (Tier 1)",
-    "age": "Age",
-    "log_salary": "Monthly salary (log scale)",
-    "loan_count": "Number of loans",
-    "is_self_employed": "Self-employed",
+    "debt_to_income": "Your total loans compared with your yearly income",
+    "emi_to_salary": "Share of your salary going to loan payments",
+    "credit_utilization": "Share of your credit card limit you are using",
+    "expense_to_salary": "Share of your salary going on everyday spending",
+    "emergency_fund_months": "Savings you could live on (months of spending)",
+    "investment_to_salary": "Share of your salary you invest",
+    "surplus_k": "Money left at the end of the month",
     "is_informal": "Informal or daily-wage work",
-    "surplus_k": "Monthly surplus after expenses and EMI (₹10,000s)",
+    "is_self_employed": "Self-employed",
+    "is_metro": "Living in a big metro city",
+    "log_salary": "Your monthly salary",
+    "loan_count": "Number of loans",
+    "dependents": "People who rely on your income",
+    "age": "Your age",
 }
 
+RATIO_FEATURES = {"debt_to_income", "emi_to_salary", "expense_to_salary",
+                  "investment_to_salary", "credit_utilization"}
+YES_NO_FEATURES = {"is_informal", "is_self_employed", "is_metro"}
 HIGHER_IS_WORSE = {"debt_to_income", "emi_to_salary", "credit_utilization", "expense_to_salary", "is_informal"}
 LOWER_IS_WORSE = {"emergency_fund_months", "investment_to_salary", "surplus_k"}
 
 ADVICE = {
-    "debt_to_income": "Your loan balance is high relative to your yearly income. Prioritise repaying the most expensive loan first.",
-    "emi_to_salary": "EMIs take a large share of your salary. Look at refinancing or prepaying the costliest loan.",
-    "credit_utilization": "You are using a large share of your credit limit. Bringing card balances below 30% helps.",
-    "expense_to_salary": "Living costs take most of your salary. Review fixed costs first.",
-    "emergency_fund_months": "Your emergency savings cover few months of expenses. A common target is 3 to 6 months.",
-    "investment_to_salary": "Little is being invested. A small regular investment can start once the emergency fund is in place.",
-    "surplus_k": "Little is left after expenses and EMIs each month. Cutting one fixed cost or one EMI would widen your cushion.",
+    "debt_to_income": "Your loans are large compared with your yearly income. Paying off the most expensive loan first saves the most.",
+    "emi_to_salary": "A large share of your salary goes to loan payments. Ask your lender about lowering the rate or combining loans.",
+    "credit_utilization": "You are using much of your credit card limit. Keeping card balances below 30% of the limit helps.",
+    "expense_to_salary": "Everyday spending takes most of your salary. Start by reviewing fixed costs such as subscriptions and bills.",
+    "emergency_fund_months": "Your savings would last only a few months. Aim for 3 to 6 months of spending in a separate account.",
+    "investment_to_salary": "You invest only a small part of your salary. A small regular amount is a good start once savings are in place.",
+    "surplus_k": "Very little is left after spending and loan payments. Even a small cut in one bill would make a difference.",
 }
 
 
@@ -75,17 +83,15 @@ def load_stable_medians():
     feats = build_features(raw)[FEATURES]
     stable = raw["health_class"] == "Stable"
     borrower = raw["monthly_emi"] > 0
-
     med = feats[stable].median()
-    # Loan factors are compared with Stable households that have a loan
+    # Loan factors are compared with "on track" households that have a loan
     loan_cols = ["debt_to_income", "emi_to_salary"]
     med[loan_cols] = feats.loc[stable & borrower, loan_cols].median()
     return med
 
 
-# ---------- model call ----------
+# ---------- model calls ----------
 def predict(profile: dict):
-    """One entry point for every part of the page: profile in, class and probabilities out."""
     model = load_model()
     X = build_features(pd.DataFrame([profile])[RAW_COLUMNS])[FEATURES]
     raw = model.predict_proba(X)[0]
@@ -102,79 +108,211 @@ def is_worse(feature, value, typical, tolerance=0.10):
     return False
 
 
+def fmt_value(feature, value):
+    """Show each factor in the unit a user would recognise."""
+    if feature in RATIO_FEATURES:
+        return f"{value:.0%}"
+    if feature == "emergency_fund_months":
+        return f"{value:.1f} months"
+    if feature == "surplus_k":
+        return f"₹{value * 10000:,.0f}"
+    if feature == "log_salary":
+        return f"₹{math.exp(value):,.0f}"
+    if feature in YES_NO_FEATURES:
+        return "Yes" if value >= 0.5 else "No"
+    return f"{value:g}"
+
+
 def driver_table(x, top_n=4):
     stable = load_stable_medians()
     importance = load_metrics()["importance"]
-    top = [f for f in importance if f in FEATURES][:top_n]
+    top = [f for f in importance if f in LABELS][:top_n]
     rows = []
     for f in top:
         rows.append({
-            "Factor": LABELS[f],
-            "Your value": round(float(x[f]), 2),
-            "Typical Stable household": round(float(stable[f]), 2),
-            "Status": "Worse than typical" if is_worse(f, x[f], stable[f]) else "In line",
+            "What it measures": LABELS[f],
+            "Your figure": fmt_value(f, x[f]),
+            "Typical 'on track' household": fmt_value(f, stable[f]),
+            "Assessment": "Needs attention" if is_worse(f, x[f], stable[f]) else "Looks fine",
         })
     return pd.DataFrame(rows)
 
 
 def advice(x):
     stable = load_stable_medians()
-    msgs = [ADVICE[f] for f in FEATURES if f in ADVICE and is_worse(f, x[f], stable[f])]
-    return msgs or ["No factor is worse than a typical Stable household. Keep checking as your situation changes."]
+    msgs = [ADVICE[f] for f in ADVICE if is_worse(f, x[f], stable[f])]
+    return msgs or ["Nothing stands out. Keep checking in when your situation changes."]
 
 
 def prob_chart(probs):
-    df = pd.DataFrame({"Class": CLASSES, "Probability": [probs[c] for c in CLASSES]})
-    return alt.Chart(df).mark_bar().encode(
-        x=alt.X("Probability:Q", scale=alt.Scale(domain=[0, 1]), axis=alt.Axis(format="%")),
-        y=alt.Y("Class:N", sort=CLASSES, title=None),
-        tooltip=["Class", alt.Tooltip("Probability:Q", format=".1%")],
-    )
+    df = pd.DataFrame({
+        "Result": [DISPLAY[c] for c in CLASSES],
+        "Chance": [probs[c] for c in CLASSES],
+    })
+    return alt.Chart(df).mark_bar(cornerRadius=4).encode(
+        x=alt.X("Chance:Q", scale=alt.Scale(domain=[0, 1]), axis=alt.Axis(format="%", title="Chance")),
+        y=alt.Y("Result:N", sort=[DISPLAY[c] for c in CLASSES], title=None),
+        tooltip=["Result", alt.Tooltip("Chance:Q", format=".0%")],
+    ).properties(height=160)
+
+
+EXPENSE_CUTS = [0.0, 0.05, 0.10, 0.15, 0.20, 0.30]
+EMI_CUTS = [0.0, 0.10, 0.20, 0.30, 0.50]
+SAVING_ADDS = [0, 1, 2, 3, 6]
+
+
+def path_to_stable(profile, current_class):
+    """Find the smallest set of changes the model rates 'On track'.
+    Rule of thumb for 'smallest': 1 point per 1% cut in spending or loan payments, 5 points per month of savings."""
+    if current_class == "Stable":
+        return {"already_stable": True}
+
+    grid = [(ec, mc, sa) for ec in EXPENSE_CUTS for mc in EMI_CUTS for sa in SAVING_ADDS]
+    rows = []
+    for ec, mc, sa in grid:
+        p = dict(profile)
+        p["monthly_expenses"] = profile["monthly_expenses"] * (1 - ec)
+        p["monthly_emi"] = profile["monthly_emi"] * (1 - mc)
+        p["emergency_fund_months"] = profile["emergency_fund_months"] + sa
+        rows.append(p)
+
+    model = load_model()
+    X = build_features(pd.DataFrame(rows)[RAW_COLUMNS])[FEATURES]
+    proba = model.predict_proba(X)
+    stable_col = list(model.classes_).index("Stable")
+    stable_p = proba[:, stable_col]
+    new_class = [model.classes_[i] for i in proba.argmax(axis=1)]
+
+    cost = [ec * 100 + mc * 100 + sa * 5 for ec, mc, sa in grid]
+    stable_idx = [i for i in range(len(grid)) if new_class[i] == "Stable"]
+
+    if stable_idx:
+        best = min(stable_idx, key=lambda i: (cost[i], -stable_p[i]))
+        found = True
+    else:
+        best = int(stable_p.argmax())
+        found = False
+
+    ec, mc, sa = grid[best]
+    return {
+        "already_stable": False,
+        "found": found,
+        "expense_cut": ec,
+        "emi_cut": mc,
+        "savings_months": sa,
+        "stable_probability": float(stable_p[best]),
+        "new_class": new_class[best],
+    }
+
+
+def months_to_target(profile, target_months, share):
+    exp = profile["monthly_expenses"]
+    surplus = profile["monthly_salary"] - exp - profile["monthly_emi"]
+    gap = max(target_months * exp - profile["emergency_fund_months"] * exp, 0)
+    if gap == 0:
+        return 0
+    contribution = max(surplus, 0) * share
+    if contribution <= 0:
+        return None
+    return math.ceil(gap / contribution)
 
 
 # ---------- pages ----------
-def page_overview():
+def page_home():
     st.title("FinanceTwin")
-    st.subheader("A supervised model for household financial health in India")
+    st.subheader("Understand your household's money health in a few minutes")
     st.write(
-        "Enter one household profile. A trained model predicts whether the household is Stable, "
-        "Stretched or Distressed, explains which factors drive that prediction, and shows how "
-        "changes would shift it."
+        "Most budgeting apps only show where your money went. FinanceTwin tells you whether your "
+        "finances are on track, getting tight, or under strain, explains what is behind that result, "
+        "and suggests what could help."
     )
-    m = load_metrics()
+
+    st.subheader("How to use it")
     a, b, c = st.columns(3)
-    a.metric("Households in training data", f"{m['train_rows'] + m['test_rows']:,}")
-    b.metric("Selected model", m["selected"])
-    c.metric("Macro-F1 on held-out test set", f"{m['models'][m['selected']]['test_macro_f1']:.2f}")
+    with a.container(border=True):
+        st.markdown("**1. Enter your figures**")
+        st.write("Type in your pay, spending, loan payments and savings. Each box explains what to enter.")
+    with b.container(border=True):
+        st.markdown("**2. See your result**")
+        st.write("You get one of three results, with the main reasons behind it.")
+    with c.container(border=True):
+        st.markdown("**3. Try changes**")
+        st.write("Test what would happen if you cut spending, lowered a loan payment or saved more.")
+
+    st.subheader("What you get")
+    st.write(
+        "- A simple result: **On track**, **Getting tight** or **Under strain**\n"
+        "- The main reasons for your result, in plain words\n"
+        "- The simplest changes that could move you to **On track**\n"
+        "- A timeline for building a safety cushion of savings"
+    )
+
+    m = load_metrics()
+    acc = m["models"][m["selected"]]["test_accuracy"]
     st.info(
-        "The training data is synthetic, built from assumptions about Indian households. Accuracy "
-        "shows how well the method recovers the labelling rule, not performance on real "
-        "households. See About & Evidence."
+        f"**Please note:** this tool was built and tested on made-up households, not real people. "
+        f"In tests it classed about {round(acc * 100)} in every 100 of them correctly. It gives "
+        "an estimate to help you think, not financial advice."
     )
 
 
 def page_check():
-    st.title("Financial Check")
-    st.write("Enter your household figures in rupees. The same model answers every question on this page.")
+    st.title("Check your money health")
+    st.write("Fill in your details on the left. Your result and tips appear on the right. Amounts are per month, in rupees.")
 
     left, right = st.columns([1, 1.2], gap="large")
     with left:
-        st.subheader("Your household")
-        salary = st.slider("Monthly in-hand salary (₹)", 10000, 400000, 40000, step=1000)
-        employment = st.selectbox("Type of work", EMPLOYMENT_TYPES,
-                                  format_func=lambda e: e.replace("_", " ").capitalize())
-        loans = st.slider("Number of loans", 0, 3, 1)
-        expenses = st.slider("Monthly living expenses, excluding EMI (₹)", 0, 250000, 22000, step=1000)
-        emi = st.slider("Total EMI per month (₹)", 0, 150000, 8000, step=500)
-        debt = st.slider("Outstanding loan balance (₹)", 0, 5000000, 300000, step=10000)
-        util = st.slider("Credit card utilisation (%)", 0, 100, 25)
-        emergency = st.slider("Emergency savings (months of expenses)", 0.0, 24.0, 3.0, step=0.5)
-        invest = st.slider("Invested per month (₹)", 0, 100000, 4000, step=500)
-        age = st.slider("Age", 21, 59, 35)
-        dependents = st.slider("Dependents", 0, 4, 2)
-        tier = st.radio("City tier", [1, 2, 3], index=1, horizontal=True,
-                        format_func=lambda t: f"Tier {t}")
-        st.caption("Results are most reliable within the ranges of the training data.")
+        st.subheader("Your details")
+        salary = st.slider(
+            "Monthly take-home pay (₹)", 10000, 400000, 40000, step=1000,
+            help="The salary you actually receive each month, after tax and deductions.",
+        )
+        employment = st.selectbox(
+            "Type of work", EMPLOYMENT_TYPES,
+            format_func=lambda e: {"salaried": "Salaried (fixed monthly pay)",
+                                   "self_employed": "Self-employed or business",
+                                   "informal": "Informal or daily wage"}[e],
+            help="Choose the option that best describes how you earn.",
+        )
+        loans = st.slider(
+            "Number of loans you are repaying", 0, 3, 1,
+            help="Home, personal, vehicle or card loans. Choose 0 if you have none.",
+        )
+        expenses = st.slider(
+            "Monthly everyday spending (₹)", 0, 250000, 22000, step=1000,
+            help="Food, rent, travel, bills and school fees. Do not include loan payments.",
+        )
+        emi = st.slider(
+            "Total monthly loan payments, called EMI (₹)", 0, 150000, 8000, step=500,
+            help="All your monthly loan instalments added together.",
+        )
+        debt = st.slider(
+            "Total still owed on all loans (₹)", 0, 5000000, 300000, step=10000,
+            help="The amount you still have to repay, not the monthly payment.",
+        )
+        util = st.slider(
+            "Credit card limit used (%)", 0, 100, 25,
+            help="Your card balance divided by your card limit. 25% means you use a quarter of the limit.",
+        )
+        emergency = st.slider(
+            "Savings you could live on (months)", 0.0, 24.0, 3.0, step=0.5,
+            help="Money in savings or easy-to-access funds, divided by your monthly spending. "
+                 "3 means your savings would cover three months of spending.",
+        )
+        invest = st.slider(
+            "Amount invested each month (₹)", 0, 100000, 4000, step=500,
+            help="Money you put into investments such as mutual funds, PPF or fixed deposits.",
+        )
+        age = st.slider("Your age", 21, 59, 35)
+        dependents = st.slider(
+            "People who rely on your income", 0, 4, 2,
+            help="Children, parents or others who depend on your earnings.",
+        )
+        tier = st.radio(
+            "Where do you live?", [1, 2, 3], index=1, horizontal=True,
+            format_func=lambda t: {1: "Big metro", 2: "Large city", 3: "Small town"}[t],
+            help="Big cities usually have higher rent and everyday costs. Your monthly spending figure should include those costs.",
+        )
 
     profile = {
         "monthly_salary": salary,
@@ -194,32 +332,37 @@ def page_check():
     cls, probs, x = predict(profile)
 
     with right:
-        st.subheader("Prediction")
-        st.metric("Predicted financial-health class", cls)
-        st.altair_chart(prob_chart(probs))
+        st.subheader("Your result")
+        st.metric("Money health", DISPLAY[cls])
+        st.altair_chart(prob_chart(probs), use_container_width=True)
+
         if cls == "Stable":
-            st.success("This household's profile looks Stable.")
+            st.success("You look on track. Keep your savings and loan payments steady.")
         elif cls == "Stretched":
-            st.warning("This household's profile looks Stretched: some pressure, but not yet critical.")
+            st.warning("Your finances are getting tight. Small changes now can prevent bigger problems later.")
         else:
-            st.error("This household's profile looks Distressed: repayments and savings are under serious strain.")
-        st.caption("Model-based estimate from synthetic data. Not financial advice.")
+            st.error(
+                "Your finances look under strain. Consider talking to a financial adviser or a "
+                "non-profit credit counsellor."
+            )
 
-        st.subheader("What is driving this")
-        st.table(driver_table(x))
+        st.subheader("What is affecting your result")
+        st.table(driver_table(x).set_index("What it measures"))
 
-        st.subheader("Suggestions")
+        st.subheader("What you could do")
         for msg in advice(x):
             st.info(msg)
 
+        st.caption("An estimate from a model trained on made-up households. Not financial advice.")
+
     st.divider()
-    st.subheader("What if...?")
-    st.caption("The same model re-scores the household after each change.")
+    st.subheader("Try a change")
+    st.caption("Move a slider to see how a change could affect your result. Your original figures stay as they are.")
     w1, w2, w3, w4 = st.columns(4)
-    d_sal = w1.slider("Change in salary (%)", -50, 50, 0)
-    d_exp = w2.slider("Change in expenses (%)", -50, 50, 0)
-    d_emi = w3.slider("Change in EMI (₹)", -20000, 20000, 0, step=500)
-    d_sav = w4.slider("Change in emergency savings (months)", -3.0, 6.0, 0.0, step=0.5)
+    d_sal = w1.slider("Change my take-home pay by (%)", -50, 50, 0)
+    d_exp = w2.slider("Change my spending by (%)", -50, 50, 0)
+    d_emi = w3.slider("Change my loan payments by (₹)", -20000, 20000, 0, step=500)
+    d_sav = w4.slider("Change my savings by (months)", -3.0, 6.0, 0.0, step=0.5)
 
     scenario = dict(
         profile,
@@ -231,98 +374,161 @@ def page_check():
     )
     s_cls, s_probs, _ = predict(scenario)
 
+    order = {c: i for i, c in enumerate(CLASSES)}
+    steps = order[s_cls] - order[cls]
+    if steps == 0:
+        result_delta = None
+    elif steps > 0:
+        result_delta = f"Worse: {steps} step{'s' if steps > 1 else ''} down from {DISPLAY[cls]}"
+    else:
+        result_delta = f"Better: {-steps} step{'s' if steps < -1 else ''} up from {DISPLAY[cls]}"
+
+    dd = (s_probs["Distressed"] - probs["Distressed"]) * 100
+    strain_delta = None if round(dd) == 0 else f"{dd:+.0f} points"
+
     c1, c2 = st.columns(2)
-    c1.metric("Predicted class (what-if)", s_cls, delta=None if s_cls == cls else f"was {cls}")
+    c1.metric("Money health after this change", DISPLAY[s_cls], delta=result_delta)
     c2.metric(
-        "Chance of Distressed (what-if)",
+        "Chance of being under strain",
         f"{s_probs['Distressed']:.0%}",
-        delta=f"{(s_probs['Distressed'] - probs['Distressed']) * 100:+.0f} points",
+        delta=strain_delta,
         delta_color="inverse",
     )
 
+    st.divider()
+    st.subheader("Simplest steps to get to 'On track'")
+    st.caption(
+        "Based on the scenario above (the same as your figures when the sliders are at zero). "
+        "Lowering loan payments assumes refinancing or combining loans, which cuts the monthly "
+        "amount without changing what you owe."
+    )
 
-def page_about():
-    st.title("About & Evidence")
+    plan = path_to_stable(scenario, s_cls)
+    if plan["already_stable"]:
+        st.success("You are already on track. No change is needed, but keep your savings growing.")
+    else:
+        steps_text = []
+        if plan["expense_cut"] > 0:
+            steps_text.append(f"cut everyday spending by {plan['expense_cut']:.0%}")
+        if plan["emi_cut"] > 0:
+            steps_text.append(f"lower monthly loan payments by {plan['emi_cut']:.0%}")
+        if plan["savings_months"] > 0:
+            steps_text.append(f"build savings up by {plan['savings_months']} month(s) of spending")
+        joined = " and ".join(steps_text)
+        if plan["found"]:
+            st.info(
+                f"The simplest combination that could move you to **On track**: {joined}. "
+                f"The estimated chance of being on track rises to {plan['stable_probability']:.0%}."
+            )
+        else:
+            st.warning(
+                "No combination in the range we tested reaches On track. The best option, "
+                f"{joined}, would move you to {DISPLAY[plan['new_class']]} "
+                f"({plan['stable_probability']:.0%} chance of being on track). Bigger changes, "
+                "or a higher income, would be needed."
+            )
+
+    st.subheader("How long to build a safety cushion")
+    f1, f2 = st.columns(2)
+    share = f1.slider(
+        "Share of your monthly leftover you can set aside (%)", 10, 100, 50, step=5,
+        help="Leftover means pay minus spending minus loan payments.",
+    )
+    target = f2.slider(
+        "Savings goal (months of spending)", 3, 12, 6,
+        help="Three to six months of spending is a common safety-cushion goal.",
+    )
+    months = months_to_target(scenario, target, share / 100)
+    if months is None:
+        st.warning("You have no money left at the end of the month, so savings cannot grow yet. Lower spending or loan payments first.")
+    elif months == 0:
+        st.success(f"You already have at least {target} months of spending saved. Well done.")
+    else:
+        st.info(
+            f"Setting aside {share}% of your leftover each month, you reach {target} months of "
+            f"savings in about {months} months ({months / 12:.1f} years)."
+        )
+
+
+def page_how_it_works():
+    st.title("How it works")
     m = load_metrics()
     groups_all = load_group_report()
     groups = groups_all[groups_all["model"] == m["selected"]]
-
-    def group_value(dim, grp, col):
-        return groups.loc[(groups["dimension"] == dim) & (groups["group"] == grp), col].iloc[0]
-
-    informal_acc = group_value("employment", "informal", "accuracy")
-    top_band_n = int(group_value("income band", "2L-4L", "n"))
+    acc = m["models"][m["selected"]]["test_accuracy"]
 
     st.markdown(
         """
-**FinanceTwin** is a supervised model that reads a household's finances and predicts whether it is Stable, Stretched or Distressed.
+### In simple words
+FinanceTwin looks at the same things a bank would: how much you earn, what you spend, how big your loan payments are and how much you could fall back on. It then places your household in one of three groups:
 
-### How the model was built
-1. **Data:** 150,000 synthetic Indian households. Salaries range from ₹10,000 to ₹4,00,000 a month, with salaried, self-employed and informal workers, zero to three loans, and three city tiers. The health label comes from a documented risk formula plus noise.
-2. **Definition of financial health:** the label combines two measures. The first is burden relative to income: EMI, debt and credit use as shares of salary or income. The second is the rupee cushion left after expenses and EMI, because that cushion determines whether a household can absorb a shock. Both are our assumptions about what financial health means, not estimates from data.
-3. **Features:** 14 ratios and attributes, built by one shared function that both training and the app use.
-4. **Models:** two candidates, logistic regression and random forest.
-5. **Selection:** both were scored with five-fold cross-validation on the training split only, using macro-F1.
-6. **Final check:** the 20% held-out test set was used once, after selection.
+- **On track:** your income covers your spending and loans, with room to save.
+- **Getting tight:** there is some pressure, but you still have room to act.
+- **Under strain:** repayments and spending leave little margin, so a small shock could cause problems.
+
+### How accurate is it?
+In tests on made-up households, about **{round(acc * 100)} in every 100** were placed in the right group. Almost all mistakes were between neighbouring groups, such as **On track** and **Getting tight**. Mistakes that jumped from **On track** straight to **Under strain** were very rare.
+
+### What it cannot do
+- It was built and tested on **made-up households**, so it shows how the method works, not how it would perform on real people.
+- It does not know the interest rate on your loans, your tax position or your long-term goals.
+- It is not financial advice. For decisions about loans, investments or debt, speak to a qualified adviser.
 """
     )
 
-    st.subheader("Model comparison")
-    rows = {}
-    for name, r in m["models"].items():
-        rows[name] = {
-            "CV macro-F1": f"{r['cv_macro_f1_mean']:.3f} ± {r['cv_macro_f1_std']:.3f}",
-            "Test accuracy": r["test_accuracy"],
-            "Test macro-F1": r["test_macro_f1"],
-        }
-    base = m["reference"]["Majority-class baseline"]
-    rows["Majority-class baseline (reference only)"] = {
-        "CV macro-F1": "n/a",
-        "Test accuracy": base["test_accuracy"],
-        "Test macro-F1": base["test_macro_f1"],
-    }
-    st.table(pd.DataFrame(rows).T)
-    st.success(f"**Selected: {m['selected']}.** {m['selection_reason']}")
+    with st.expander("Words explained"):
+        st.markdown(
+            """
+- **EMI:** the fixed monthly instalment you pay on a loan.
+- **Credit card limit used:** your card balance divided by your card limit.
+- **Savings you could live on:** your easy-to-access savings divided by your monthly spending.
+- **Leftover:** what remains after spending and loan payments.
+- **Refinancing:** replacing a loan with a new one at a lower rate or longer term, which usually lowers the monthly payment.
+- **Safety cushion:** savings that cover several months of spending, for emergencies.
+"""
+        )
 
-    st.subheader("Confusion matrix on the test set (rows: actual, columns: predicted)")
-    cm = pd.DataFrame(m["confusion_matrix"], index=m["class_order"], columns=m["class_order"])
-    st.table(cm)
+    with st.expander("Technical details (for readers who want them)"):
+        st.write(
+            "The model is a supervised classifier trained on 150,000 synthetic households, with the "
+            "label built from burden relative to income and the rupee leftover. Two models were "
+            "compared with five-fold cross-validation, and the held-out test set was used once."
+        )
+        rows = {}
+        for name, r in m["models"].items():
+            rows[name] = {
+                "Cross-validated macro-F1": f"{r['cv_macro_f1_mean']:.3f} ± {r['cv_macro_f1_std']:.3f}",
+                "Test accuracy": r["test_accuracy"],
+                "Test macro-F1": r["test_macro_f1"],
+            }
+        st.table(pd.DataFrame(rows).T)
+        st.write(f"Selected model: **{m['selected']}**. {m['selection_reason']}")
 
-    st.subheader("Performance by household type (test set, selected model)")
-    st.caption("Accuracy is the more reliable measure for small groups. Macro-F1 is unstable when a group has few cases of one class.")
-    st.table(groups.drop(columns="model").set_index(["dimension", "group"]))
+        st.write("**Confusion matrix on the test set** (rows: actual, columns: predicted)")
+        cm = pd.DataFrame(m["confusion_matrix"], index=m["class_order"], columns=m["class_order"])
+        st.table(cm)
 
-    st.subheader("Where the errors fall (training split, cross-validated)")
-    st.caption(
-        "A separate analysis on the training split, so these figures are not the test-set results above. "
-        "A neighbour error is one between adjacent classes (Stable and Stretched, or Stretched and Distressed)."
-    )
-    diag = load_error_diagnosis()
-    st.table(diag.set_index(["dimension", "group"])[
-        ["n", "accuracy", "errors", "neighbour_error_share", "stable_vs_distressed_errors"]
-    ])
+        st.write("**Accuracy by household type (test set)**")
+        st.table(groups.drop(columns="model").set_index(["dimension", "group"]))
+
+        st.write("**Where errors fall (training split)**")
+        st.table(load_error_diagnosis().set_index(["dimension", "group"])[
+            ["n", "accuracy", "errors", "neighbour_error_share", "stable_vs_distressed_errors"]
+        ])
 
     st.markdown(
-        f"""
-### Income and the trade-off
-We tested three definitions of financial health. A ratio-only label gave overall test accuracy of 0.871, with informal-worker accuracy of 0.826. A buffer penalty for low salaries gave 0.869 overall but reduced informal accuracy to 0.797. The surplus definition used here gave 0.877 overall, with informal accuracy of 0.813 and accuracy of 0.826 for households earning under ₹20,000. Surplus improves overall accuracy compared with the ratio-only model, but it costs some accuracy for informal and low-income households. We report this trade-off instead of choosing the setting that looks best overall.
-
-### Limitations
-- **Synthetic data.** High accuracy shows the model recovers the labelling rule, not that it predicts real households.
-- **Definition is a choice.** The surplus term reflects our view of financial health. Real data would show whether it predicts outcomes.
-- **Informal households.** Accuracy for informal workers is {informal_acc:.1%}. In the training-split analysis, about 24% of Stable informal households are flagged as Stretched, against about 8% of salaried households.
-- **Boundary errors.** Almost all errors are between neighbouring classes. Only a handful are Stable versus Distressed.
-- **Thin top income band.** The ₹2L to ₹4L band has {top_band_n} test households, so its scores are unreliable.
-- **Decision support only.** This is a model-based estimate, not financial advice. Real validation needs household microdata, for example the MoSPI AIDIS 2019 unit-level data, and review by a qualified adviser.
+        """
+### Our assumptions
+Financial health is defined in two ways in this tool: how much of your income goes on loan payments and debts, and how much is left at the end of the month. Both are our assumptions about what matters. Real data would show whether they predict real outcomes.
 """
     )
 
 
 # ---------- navigation ----------
 PAGES = {
-    "Overview": page_overview,
-    "Financial Check": page_check,
-    "About & Evidence": page_about,
+    "Home": page_home,
+    "Check my money health": page_check,
+    "How it works": page_how_it_works,
 }
 
 st.sidebar.title("FinanceTwin")
